@@ -4,30 +4,16 @@ import datetime
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+
 from flask import Flask, request, jsonify
 import requests
 
-
-
-# Optional RTL helpers (Hebrew)
+# Optional RTL helpers
 try:
-    from bidi.algorithm import get_display as bidi_get_display
+    from bidi.algorithm import get_display
 except Exception:
-    bidi_get_display = None
-
-def has_hebrew(s: str) -> bool:
-    return any("\u0590" <= ch <= "\u05FF" for ch in (s or ""))
-
-def rtl(text: str) -> str:
-    if text is None:
-        return ""
-    s = str(text)
-    if has_hebrew(s) and bidi_get_display:
-        # bidi מחזיר "visual order" שמתאים ל-ReportLab
-        return bidi_get_display(s, base_dir="R")
-    return s
-
-
+    def get_display(s, base_dir=None):  # fallback
+        return s
 
 # ReportLab
 from reportlab.pdfgen import canvas
@@ -41,7 +27,7 @@ from reportlab.lib.units import mm
 app = Flask(__name__)
 
 # =========================
-# 0) WHATSAPP CONFIG (תמלא רק אם צריך)
+# 0) WHATSAPP CONFIG
 # =========================
 VERIFY_TOKEN = "walev_verify_123"
 PHONE_NUMBER_ID = "931796590022288"
@@ -49,7 +35,7 @@ WHATSAPP_TOKEN = "EAAdeaX8RHTUBQp3mLOxdMZAlL40zqxJUi5muDK9LrqgiFIkyVg83nEE2VS1KB
 GRAPH_VERSION = "v22.0"
 
 # דומיין ציבורי של האפליקציה (LIVE)
-PUBLIC_BASE_URL = "https://walev.pythonanywhere.com"  # ✅ אצלך
+PUBLIC_BASE_URL = "https://walev.pythonanywhere.com"
 
 # אדמינים לפי מספר WA-ID (בלי +)
 ADMIN_PHONES = {"972547474646"}
@@ -72,11 +58,10 @@ EASY_REVIEW_URL = "https://easy.co.il/page/10118064"
 # ======================
 # PAYPAL (LIVE)
 # ======================
-# ✅ תמלא 2 שורות אלה (LIVE)
 PAYPAL_CLIENT_ID = "AU3U52qcEE20apC4OUTB88PIyKw7ol9nexrciMGrmMbetc94e2kN0bUdlZdBHfRXu49FEUFZKKQ2JgIq"
 PAYPAL_CLIENT_SECRET = "EAsylE4gN6dpIqt0i8FpSxcA0Dt7phe9D2UF3LQ33MACLP25uOZv0qzzC5iZB3KuYF2JLjqyK0KC2lS-"
 
-PAYPAL_API_BASE = "https://api-m.paypal.com"  # LIVE
+PAYPAL_API_BASE = "https://api-m.paypal.com"
 CURRENCY = "ILS"
 
 # ======================
@@ -124,7 +109,7 @@ def init_db_and_migrate():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        wa_id TEXT,
+        wa_id TEXT,                 -- whatsapp user id (המספר של הלקוח בלי +)
         customer_name TEXT,
         customer_phone TEXT,
 
@@ -155,11 +140,26 @@ def init_db_and_migrate():
     conn.commit()
     conn.close()
 
-
 def next_invoice_no(conn) -> int:
     r = conn.execute("SELECT MAX(COALESCE(invoice_no,0)) AS m FROM orders").fetchone()
     return int(r["m"] or 0) + 1
 
+# ======================
+# RTL / PDF
+# ======================
+def has_hebrew(s: str) -> bool:
+    return any("\u0590" <= ch <= "\u05FF" for ch in (s or ""))
+
+def rtl(text: str) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    if has_hebrew(s):
+        try:
+            return get_display(s, base_dir="R")
+        except Exception:
+            return get_display(s)
+    return s
 
 def register_font() -> str:
     try:
@@ -169,7 +169,6 @@ def register_font() -> str:
     except Exception as e:
         log(f"FONT register error: {e}")
     return "Helvetica"
-
 
 def money(x: float) -> str:
     try:
@@ -296,6 +295,41 @@ def wa_send_list(to_wa_id: str, title: str, body: str, button: str, sections: li
         }
     })
 
+def wa_send_buttons(to_wa_id: str, body: str, buttons: list):
+    """
+    Reply Buttons: עד 3 כפתורים
+    buttons example:
+    [{"id":"btn:menu","title":"📋 תפריט"}, ...]
+    """
+    buttons = (buttons or [])[:3]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                    for b in buttons
+                ]
+            }
+        }
+    }
+    return wa_post(payload)
+
+def wa_send_quickbar(wa_id: str, text: str = "בחר פעולה מהירה 👇"):
+    return wa_send_buttons(
+        wa_id,
+        text,
+        [
+            {"id": "btn:menu", "title": "📋 תפריט"},
+            {"id": "btn:checkpay", "title": "🔄 בדיקת תשלום"},
+            {"id": "btn:agent", "title": "👨‍🔧 נציג"},
+        ],
+    )
+
 def wa_upload_media(file_path: str, mime_type: str = "application/pdf") -> str:
     url = f"https://graph.facebook.com/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
@@ -316,12 +350,10 @@ def wa_send_document(to_wa_id: str, file_path: str, caption: str = "🧾 חשב�
     })
 
 def is_admin_wa(wa_id: str) -> bool:
-    w = str(wa_id or "").strip().replace("+", "")
-    return w in {str(x).strip().replace("+", "") for x in ADMIN_PHONES}
-
+    return str(wa_id) in ADMIN_PHONES
 
 # ======================
-# PAYPAL HELPERS (LIVE)
+# PAYPAL HELPERS
 # ======================
 _pp_token: Dict[str, Any] = {"value": None, "exp": 0}
 
@@ -452,7 +484,6 @@ def create_order_local(wa_id: str, name: str, phone: str, item1: str, item2: str
     conn.commit()
     order_id = int(cur.lastrowid)
 
-    # יצירת PAYPAL ORDER אמיתי + לינק ייחודי
     pp_order_id, approve_url = paypal_create_order(order_id, total)
     conn.execute(
         "UPDATE orders SET paypal_order_id=?, pay_link=?, paypal_status=? WHERE id=?",
@@ -473,6 +504,91 @@ def create_order_local(wa_id: str, name: str, phone: str, item1: str, item2: str
         "items": items_list,
     }
 
+# ✅ Pay any amount (ללקוח וגם לאדמין)
+def create_order_custom_amount(wa_id: str, name: str, phone: str, amount: float, label: str = "💳 תשלום סכום אחר") -> Dict[str, Any]:
+    try:
+        amount = float(amount)
+    except Exception:
+        raise ValueError("bad_amount")
+    if amount <= 0:
+        raise ValueError("bad_amount")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO orders (
+            wa_id, customer_name, customer_phone,
+            item1_key, item1_label, item1_amount,
+            item2_key, item2_label, item2_amount,
+            total_amount, note, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(wa_id), name, phone,
+        "custom", label, float(amount),
+        "", "", None,
+        float(amount), NOTE_DEFAULT, "pending", now_iso()
+    ))
+    conn.commit()
+    order_id = int(cur.lastrowid)
+
+    pp_order_id, approve_url = paypal_create_order(order_id, float(amount))
+    conn.execute(
+        "UPDATE orders SET paypal_order_id=?, pay_link=?, paypal_status=? WHERE id=?",
+        (pp_order_id, approve_url, "CREATED", order_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "order_id": order_id,
+        "paypal_order_id": pp_order_id,
+        "approve_url": approve_url,
+        "total": float(amount),
+        "items": [{"label": label, "amount": float(amount)}],
+    }
+
+# ✅ אדמין: חשבונית ידנית (בלי תשלום)
+def create_manual_invoice_and_pdf(wa_id: str, amount: float) -> Tuple[int, str]:
+    try:
+        amount = float(amount)
+    except Exception:
+        raise ValueError("bad_amount")
+    if amount <= 0:
+        raise ValueError("bad_amount")
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO orders (
+            wa_id, customer_name, customer_phone,
+            item1_key, item1_label, item1_amount,
+            item2_key, item2_label, item2_amount,
+            total_amount, note, status, created_at, paid_at,
+            paypal_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(wa_id),
+        "חשבונית ידנית (אדמין)",
+        str(wa_id),
+        "manual", "🛠️ חשבונית ידנית (ללא תשלום)", float(amount),
+        "", "", None,
+        float(amount), NOTE_DEFAULT, "paid", now_iso(), now_iso(),
+        "MANUAL"
+    ))
+    conn.commit()
+    order_id = int(cur.lastrowid)
+
+    inv_no = next_invoice_no(conn)
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    pdf_path = build_invoice(dict(row), inv_no)
+
+    conn.execute("UPDATE orders SET invoice_no=?, invoice_pdf_path=? WHERE id=?", (inv_no, pdf_path, order_id))
+    conn.commit()
+    conn.close()
+
+    return order_id, pdf_path
+
 def finalize_paid_and_send_invoice(order_id: int, capture_id: Optional[str] = None, paypal_status: Optional[str] = None) -> str:
     conn = db()
     row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -480,7 +596,6 @@ def finalize_paid_and_send_invoice(order_id: int, capture_id: Optional[str] = No
         conn.close()
         raise FileNotFoundError("order_not_found")
 
-    # אם כבר יש חשבונית
     if row["invoice_pdf_path"] and os.path.isfile(row["invoice_pdf_path"]):
         conn.execute(
             "UPDATE orders SET status='paid', paid_at=?, paypal_capture_id=COALESCE(paypal_capture_id, ?), paypal_status=COALESCE(paypal_status, ?) WHERE id=?",
@@ -524,6 +639,7 @@ sessions: Dict[str, Dict[str, Any]] = {}
 def show_main_menu(wa_id: str):
     rows = [
         {"id": "menu:pay", "title": "💳 הזמנה ותשלום", "description": "יוצר לינק תשלום ייחודי"},
+        {"id": "menu:pay_any", "title": "💳 תשלום סכום אחר", "description": "מקדמה / אבחון / יתרה"},
         {"id": "menu:pricelist", "title": "📋 מחירון", "description": "מחירים"},
         {"id": "menu:reviews", "title": "⭐ ביקורות", "description": "גוגל + איזי"},
         {"id": "menu:navigate", "title": "🧭 ניווט", "description": "Waze"},
@@ -531,6 +647,7 @@ def show_main_menu(wa_id: str):
         {"id": "menu:restore", "title": "🧾 שחזור חשבונית", "description": "לפי טלפון"},
     ]
     if is_admin_wa(wa_id):
+        rows.append({"id": "admin:pay_any", "title": "💳 אדמין: חיוב סכום חופשי", "description": "יוצר לינק PayPal לכל סכום"})
         rows.append({"id": "admin:manual_invoice", "title": "🛠️ אדמין (חשבונית ידנית)", "description": "בלי תשלום"})
 
     sections = [{"title": "תפריט", "rows": rows}]
@@ -541,6 +658,7 @@ def show_main_menu(wa_id: str):
         button="פתח תפריט",
         sections=sections
     )
+    wa_send_quickbar(wa_id)
 
 def show_items_menu(wa_id: str, step: str, include_none: bool):
     rows = [
@@ -560,17 +678,13 @@ def show_items_menu(wa_id: str, step: str, include_none: bool):
         button="בחר פריט",
         sections=[{"title": "פריטים", "rows": rows}]
     )
+    wa_send_quickbar(wa_id)
 
 # ======================
-# PAYPAL RETURN/CANCEL (אימות תשלום אמיתי!)
+# PAYPAL RETURN/CANCEL
 # ======================
 @app.get("/paypal/return")
 def paypal_return():
-    """
-    PayPal יחזיר לכאן אחרי אישור תשלום.
-    פה אנחנו עושים CAPTURE אמיתי.
-    אם COMPLETED -> מפיק חשבונית ושולח בוואטסאפ.
-    """
     oid = (request.args.get("oid") or "").strip()
     if not oid.isdigit():
         return "Missing oid", 400
@@ -587,10 +701,9 @@ def paypal_return():
 
     try:
         cap = paypal_capture_order(pp_order_id)
-        status = cap.get("status")  # COMPLETED expected
+        status = cap.get("status")
         capture_id = extract_capture_id(cap)
 
-        # עדכון סטטוס ב-DB
         conn = db()
         conn.execute(
             "UPDATE orders SET paypal_status=?, paypal_capture_id=? WHERE id=?",
@@ -603,14 +716,16 @@ def paypal_return():
             pdf_path = finalize_paid_and_send_invoice(order_id, capture_id=capture_id, paypal_status=status)
             wa_send_text(wa_id, "✅ התשלום נקלט בהצלחה! שולח חשבונית…")
             wa_send_document(wa_id, pdf_path, caption="🧾 חשבונית ✅")
+            wa_send_quickbar(wa_id, "רוצה עוד משהו? 👇")
             return "<h2>תודה! התשלום נקלט ✅</h2><p>אפשר לחזור ל-WhatsApp — החשבונית נשלחה.</p>"
 
+        wa_send_quickbar(wa_id, "התשלום עדיין לא הושלם. אפשר לנסות שוב 👇")
         return "<h2>התשלום עדיין לא הושלם</h2><p>חזור ל-WhatsApp ולחץ 'בדיקת תשלום'.</p>", 200
 
     except Exception as e:
         log(f"paypal_return ERROR order_id={order_id}: {e}")
+        wa_send_quickbar(wa_id, "הייתה שגיאה. נסה 'בדיקת תשלום' 👇")
         return "<h2>שגיאה בעיבוד התשלום</h2><p>חזור ל-WhatsApp ולחץ 'בדיקת תשלום'.</p>", 500
-
 
 @app.get("/paypal/cancel")
 def paypal_cancel():
@@ -648,14 +763,21 @@ def webhook_receive():
         wa_id = msg.get("from")
         msg_type = msg.get("type")
 
-        # לחיצה על List
         if msg_type == "interactive":
-            inter = msg.get("interactive", {})
-            if inter.get("type") == "list_reply":
+            inter = msg.get("interactive", {}) or {}
+            itype = inter.get("type")
+
+            # list
+            if itype == "list_reply":
                 action_id = inter["list_reply"]["id"]
                 return handle_action(wa_id, action_id)
 
-        # טקסט רגיל
+            # buttons
+            if itype == "button_reply":
+                action_id = inter["button_reply"]["id"]
+                return handle_action(wa_id, action_id)
+
+        # text
         text = (msg.get("text") or {}).get("body", "").strip()
         return handle_text(wa_id, text)
 
@@ -664,10 +786,32 @@ def webhook_receive():
         return jsonify(ok=True), 200
 
 def handle_action(wa_id: str, action_id: str):
+    # Quick Reply Buttons
+    if action_id == "btn:menu":
+        sessions.pop(wa_id, None)
+        show_main_menu(wa_id)
+        return jsonify(ok=True), 200
+
+    if action_id == "btn:checkpay":
+        return handle_action(wa_id, "menu:checkpay")
+
+    if action_id == "btn:agent":
+        wa_send_text(wa_id, "👨‍🔧 נציג יחזור אליך בהקדם.\nאפשר לכתוב כאן בקצרה מה הבעיה 🙂")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
     # תפריט
     if action_id == "menu:pay":
         sessions[wa_id] = {"step": "name"}
         wa_send_text(wa_id, "שם לקוח?")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
+    # ✅ חדש: ללקוח – תשלום סכום אחר (תיאור ואז סכום)
+    if action_id == "menu:pay_any":
+        sessions[wa_id] = {"step": "pay_any_desc"}
+        wa_send_text(wa_id, "✍️ כתוב תיאור קצר לתשלום (לדוגמה: מקדמה / אבחון / יתרה / משלוח):")
+        wa_send_quickbar(wa_id)
         return jsonify(ok=True), 200
 
     if action_id == "menu:pricelist":
@@ -697,6 +841,7 @@ def handle_action(wa_id: str, action_id: str):
     if action_id == "menu:restore":
         sessions[wa_id] = {"step": "restore_phone"}
         wa_send_text(wa_id, "הזן מספר טלפון לשחזור חשבוניות:")
+        wa_send_quickbar(wa_id)
         return jsonify(ok=True), 200
 
     if action_id == "menu:checkpay":
@@ -706,20 +851,17 @@ def handle_action(wa_id: str, action_id: str):
             show_main_menu(wa_id)
             return jsonify(ok=True), 200
 
-        # בדיקה אמיתית מול PayPal (בלי “שילמתי”)
         try:
             j = paypal_get_order(row["paypal_order_id"])
             st = j.get("status", "")
             log(f"CHECKPAY order_id={row['id']} paypal_status={st}")
 
-            # עדכון DB
             conn = db()
             conn.execute("UPDATE orders SET paypal_status=? WHERE id=?", (st, row["id"]))
             conn.commit()
             conn.close()
 
             if st == "COMPLETED":
-                # אם PayPal כבר COMPLETED – ננפיק חשבונית
                 pdf_path = finalize_paid_and_send_invoice(int(row["id"]), paypal_status=st)
                 wa_send_text(wa_id, "✅ התשלום אומת מול PayPal! שולח חשבונית…")
                 wa_send_document(wa_id, pdf_path, caption="🧾 חשבונית ✅")
@@ -736,6 +878,18 @@ def handle_action(wa_id: str, action_id: str):
         show_main_menu(wa_id)
         return jsonify(ok=True), 200
 
+    # ✅ אדמין: חיוב סכום חופשי (PayPal)
+    if action_id == "admin:pay_any":
+        if not is_admin_wa(wa_id):
+            wa_send_text(wa_id, "אין הרשאה.")
+            show_main_menu(wa_id)
+            return jsonify(ok=True), 200
+        sessions[wa_id] = {"step": "admin_pay_name"}
+        wa_send_text(wa_id, "💳 אדמין: שם לקוח?")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
+    # ✅ אדמין: חשבונית ידנית בלי תשלום
     if action_id == "admin:manual_invoice":
         if not is_admin_wa(wa_id):
             wa_send_text(wa_id, "אין הרשאה.")
@@ -743,6 +897,7 @@ def handle_action(wa_id: str, action_id: str):
             return jsonify(ok=True), 200
         sessions[wa_id] = {"step": "admin_amount"}
         wa_send_text(wa_id, "🛠️ אדמין: הזן סכום (לדוגמה 250.00):")
+        wa_send_quickbar(wa_id)
         return jsonify(ok=True), 200
 
     # בחירת פריטים
@@ -791,19 +946,19 @@ def handle_action(wa_id: str, action_id: str):
                 f"💳 סה״כ: {money(total)}\n"
                 f"ℹ️ {NOTE_DEFAULT}\n\n"
                 f"לתשלום מאובטח (PayPal):\n{approve_url}\n\n"
-                f"🔄 אחרי התשלום: פתח תפריט → 'בדיקת תשלום'\n"
-                f"או שפשוט סיים תשלום בדפדפן – החשבונית תישלח אוטומטית."
+                f"🔄 אחרי התשלום: לחץ 'בדיקת תשלום' או סיים בדפדפן – החשבונית תישלח אוטומטית."
             )
+            wa_send_quickbar(wa_id)
 
         except Exception as e:
             log(f"CREATE ORDER ERROR: {e}")
             wa_send_text(wa_id, "❌ לא הצלחתי ליצור לינק תשלום. בדוק PayPal CLIENT/SECRET ונסה שוב.")
+            wa_send_quickbar(wa_id)
 
         sessions.pop(wa_id, None)
         show_main_menu(wa_id)
         return jsonify(ok=True), 200
 
-    # ברירת מחדל
     wa_send_text(wa_id, "בחר מהתפריט 👇")
     show_main_menu(wa_id)
     return jsonify(ok=True), 200
@@ -812,106 +967,17 @@ def handle_text(wa_id: str, text: str):
     text_l = (text or "").strip().lower()
     st = sessions.get(wa_id)
 
-    # תפריט / התחלה
     if text_l in ("start", "/start", "תפריט", "menu", "התחל"):
         sessions.pop(wa_id, None)
         show_main_menu(wa_id)
         return jsonify(ok=True), 200
 
-    # ======================
-    # ADMIN manual invoice flow
-    # ======================
-    if st and st.get("step") == "admin_amount":
-        if not is_admin_wa(wa_id):
-            sessions.pop(wa_id, None)
-            wa_send_text(wa_id, "אין הרשאה.")
-            show_main_menu(wa_id)
-            return jsonify(ok=True), 200
-
-        try:
-            amt = float(text.replace(",", ".").strip())
-            if amt <= 0:
-                raise ValueError()
-        except Exception:
-            wa_send_text(wa_id, "סכום לא תקין. לדוגמה: 250.00")
-            return jsonify(ok=True), 200
-
-        st["amount"] = amt
-        st["step"] = "admin_name"
-        wa_send_text(wa_id, "שם לקוח (לקבלה ידנית):")
-        return jsonify(ok=True), 200
-
-    if st and st.get("step") == "admin_name":
-        if not is_admin_wa(wa_id):
-            sessions.pop(wa_id, None)
-            wa_send_text(wa_id, "אין הרשאה.")
-            show_main_menu(wa_id)
-            return jsonify(ok=True), 200
-
-        st["name"] = text.strip()
-        st["step"] = "admin_phone"
-        wa_send_text(wa_id, "טלפון לקוח:")
-        return jsonify(ok=True), 200
-
-    if st and st.get("step") == "admin_phone":
-        if not is_admin_wa(wa_id):
-            sessions.pop(wa_id, None)
-            wa_send_text(wa_id, "אין הרשאה.")
-            show_main_menu(wa_id)
-            return jsonify(ok=True), 200
-
-        cust_phone = text.strip()
-        amt = float(st.get("amount") or 0)
-
-        try:
-            conn = db()
-            inv_no = next_invoice_no(conn)
-            cur = conn.cursor()
-
-            cur.execute("""
-                INSERT INTO orders (
-                    wa_id, customer_name, customer_phone,
-                    item1_key, item1_label, item1_amount,
-                    item2_key, item2_label, item2_amount,
-                    total_amount, note, status, created_at, paid_at, invoice_no,
-                    paypal_status
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                str(wa_id), st.get("name",""), cust_phone,
-                "manual", "קבלה ידנית (אדמין)", amt,
-                "", "", None,
-                amt, NOTE_DEFAULT, "paid", now_iso(), now_iso(), inv_no,
-                "MANUAL"
-            ))
-
-            conn.commit()
-            order_id = int(cur.lastrowid)
-
-            row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-            pdf_path = build_invoice(dict(row), inv_no)
-
-            conn.execute("UPDATE orders SET invoice_pdf_path=? WHERE id=?", (pdf_path, order_id))
-            conn.commit()
-            conn.close()
-
-            wa_send_document(wa_id, pdf_path, caption="🧾 חשבונית ידנית ✅")
-
-        except Exception as e:
-            log(f"ADMIN INVOICE ERROR: {e}")
-            wa_send_text(wa_id, "❌ שגיאה בהפקת חשבונית אדמין. בדוק לוג.")
-        finally:
-            sessions.pop(wa_id, None)
-            show_main_menu(wa_id)
-
-        return jsonify(ok=True), 200
-
-    # ======================
-    # flow הזמנה רגיל
-    # ======================
+    # flow הזמנה רגילה
     if st and st.get("step") == "name":
         st["name"] = text.strip()
         st["step"] = "phone"
         wa_send_text(wa_id, "מספר טלפון?")
+        wa_send_quickbar(wa_id)
         return jsonify(ok=True), 200
 
     if st and st.get("step") == "phone":
@@ -920,16 +986,121 @@ def handle_text(wa_id: str, text: str):
         show_items_menu(wa_id, "item1", include_none=False)
         return jsonify(ok=True), 200
 
-    # ======================
+    # ✅ ללקוח: תשלום סכום אחר - קודם תיאור ואז סכום
+    if st and st.get("step") == "pay_any_desc":
+        desc = (text or "").strip()
+        if not desc:
+            wa_send_text(wa_id, "תיאור קצר בבקשה 🙂 (לדוגמה: מקדמה / אבחון / יתרה)")
+            wa_send_quickbar(wa_id)
+            return jsonify(ok=True), 200
+
+        st["pay_any_desc"] = desc[:40]
+        st["step"] = "pay_any_amount"
+        wa_send_text(wa_id, "💳 עכשיו כתוב סכום לתשלום (לדוגמה 150 או 150.00):")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
+    if st and st.get("step") == "pay_any_amount":
+        amt_text = (text or "").replace(",", "").strip()
+        desc = (st.get("pay_any_desc") or "תשלום סכום אחר").strip()
+
+        try:
+            amount = float(amt_text)
+            if amount <= 0:
+                raise ValueError("bad_amount")
+
+            # שם/טלפון בסיסיים (אפשר לשדרג בעתיד לשאול שם)
+            name = "לקוח"
+            phone = str(wa_id)
+
+            label = f"💳 {desc}"
+            data2 = create_order_custom_amount(wa_id, name, phone, amount, label=label)
+            order_id = data2["order_id"]
+            approve_url = data2["approve_url"]
+
+            wa_send_text(
+                wa_id,
+                f"✅ נוצר לינק תשלום #{order_id}\n"
+                f"🧾 תיאור: {desc}\n"
+                f"💳 סכום: {money(amount)}\n\n"
+                f"לתשלום מאובטח (PayPal):\n{approve_url}\n\n"
+                f"🔄 אחרי התשלום: לחץ 'בדיקת תשלום' או סיים בדפדפן – החשבונית תישלח אוטומטית."
+            )
+        except Exception as e:
+            log(f"CUSTOMER PAY ANY ERROR: {e}")
+            wa_send_text(wa_id, "❌ סכום לא תקין. נסה שוב לדוגמה: 150.00")
+            wa_send_quickbar(wa_id)
+            return jsonify(ok=True), 200
+
+        sessions.pop(wa_id, None)
+        wa_send_quickbar(wa_id, "להמשך 👇")
+        show_main_menu(wa_id)
+        return jsonify(ok=True), 200
+
+    # ✅ אדמין: Pay any amount
+    if st and st.get("step") == "admin_pay_name":
+        st["name"] = text.strip()
+        st["step"] = "admin_pay_phone"
+        wa_send_text(wa_id, "מספר טלפון של הלקוח?")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
+    if st and st.get("step") == "admin_pay_phone":
+        st["phone"] = text.strip()
+        st["step"] = "admin_pay_amount"
+        wa_send_text(wa_id, "סכום לחיוב? (לדוגמה 250 או 250.00)")
+        wa_send_quickbar(wa_id)
+        return jsonify(ok=True), 200
+
+    if st and st.get("step") == "admin_pay_amount":
+        name = (st.get("name") or "").strip()
+        phone = (st.get("phone") or "").strip()
+        amt_text = (text or "").replace(",", "").strip()
+
+        try:
+            amount = float(amt_text)
+            data2 = create_order_custom_amount(wa_id, name, phone, amount, label="💳 חיוב מיוחד")
+            order_id = data2["order_id"]
+            approve_url = data2["approve_url"]
+
+            wa_send_text(
+                wa_id,
+                f"✅ נוצר חיוב #{order_id}\n"
+                f"👤 {name} | {phone}\n"
+                f"💳 סכום: {money(amount)}\n\n"
+                f"לתשלום מאובטח (PayPal):\n{approve_url}\n\n"
+                f"🔄 אחרי התשלום: לחץ 'בדיקת תשלום' או סיים בדפדפן – החשבונית תישלח אוטומטית."
+            )
+        except Exception as e:
+            log(f"ADMIN PAY ANY ERROR: {e}")
+            wa_send_text(wa_id, "❌ סכום לא תקין או בעיה ביצירת תשלום. נסה שוב (לדוגמה 250.00).")
+
+        sessions.pop(wa_id, None)
+        show_main_menu(wa_id)
+        return jsonify(ok=True), 200
+
+    # ✅ אדמין: manual invoice (בלי תשלום)
+    if st and st.get("step") == "admin_amount":
+        amt_text = (text or "").replace(",", "").strip()
+        try:
+            amount = float(amt_text)
+            order_id, pdf_path = create_manual_invoice_and_pdf(wa_id, amount)
+            wa_send_text(wa_id, f"✅ הופקה חשבונית ידנית #{order_id}. שולח PDF…")
+            wa_send_document(wa_id, pdf_path, caption="🧾 חשבונית (ידנית) ✅")
+        except Exception as e:
+            log(f"ADMIN MANUAL INVOICE ERROR: {e}")
+            wa_send_text(wa_id, "❌ סכום לא תקין. נסה שוב לדוגמה: 250.00")
+
+        sessions.pop(wa_id, None)
+        show_main_menu(wa_id)
+        return jsonify(ok=True), 200
+
     # restore
-    # ======================
     if st and st.get("step") == "restore_phone":
         phone = text.strip()
         conn = db()
         rows = conn.execute(
-            "SELECT id, invoice_pdf_path FROM orders "
-            "WHERE customer_phone=? AND invoice_pdf_path IS NOT NULL "
-            "ORDER BY id DESC LIMIT 5",
+            "SELECT id, invoice_pdf_path FROM orders WHERE customer_phone=? AND invoice_pdf_path IS NOT NULL ORDER BY id DESC LIMIT 5",
             (phone,)
         ).fetchall()
         conn.close()
@@ -947,9 +1118,8 @@ def handle_text(wa_id: str, text: str):
         show_main_menu(wa_id)
         return jsonify(ok=True), 200
 
-    # ברירת מחדל
     wa_send_text(wa_id, "לא הבנתי 🙂 כתוב 'תפריט' או בחר מהתפריט.")
-    show_main_menu(wa_id)
+    wa_send_quickbar(wa_id)
     return jsonify(ok=True), 200
 
 # ======================
